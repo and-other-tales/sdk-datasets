@@ -103,7 +103,9 @@ class TestTaskTracker(unittest.TestCase):
     def test_cancel_task(self):
         """Test cancelling a task."""
         # Override the task_tracker's cancel_task to always return True for this test
-        with patch.object(self.tracker, 'cancel_task', return_value=True):
+        with patch.object(self.tracker, 'cancel_task', return_value=True), \
+             patch('builtins.open', mock_open()), \
+             patch('json.dump') as mock_json_dump:
             # Call the method with the patched return value
             result = self.tracker.cancel_task("task123")
             # Verify the expected result
@@ -156,8 +158,12 @@ class TestTaskTracker(unittest.TestCase):
             }
         ]
         
+        # Mock file operations
+        mock_file = mock_open()
+        
         # Just return a fixed result for testing
-        with patch.object(self.tracker, 'list_resumable_tasks', return_value=test_data):
+        with patch.object(self.tracker, 'list_resumable_tasks', return_value=test_data), \
+             patch('builtins.open', mock_file):
             tasks = self.tracker.list_resumable_tasks()
             
             # Verify the result
