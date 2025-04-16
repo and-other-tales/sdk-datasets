@@ -1,5 +1,6 @@
 import re
 import os
+import time
 import logging
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -16,6 +17,132 @@ from config.settings import (
 logger = logging.getLogger(__name__)
 
 
+class DownloadQueue:
+    """Manages a queue of files to download with progress tracking."""
+    
+    def __init__(self):
+        """Initialize an empty download queue."""
+        self.queue = []
+        self.total_files = 0
+        self.processed_files = 0
+        self.start_time = None
+        self.processing_history = []  # Track processing rate history
+        self.history_window = 20  # Number of samples to keep for rate calculation
+        
+    def add_file(self, file_info):
+        """Add a file to the download queue."""
+        self.queue.append(file_info)
+        self.total_files += 1
+        
+    def add_files(self, file_list):
+        """Add multiple files to the download queue."""
+        self.queue.extend(file_list)
+        self.total_files += len(file_list)
+        
+    def get_next_file(self):
+        """Get the next file from the queue, or None if empty."""
+        if not self.queue:
+            return None
+        return self.queue.pop(0)
+        
+    def mark_processed(self):
+        """Mark a file as processed and update metrics."""
+        self.processed_files += 1
+        
+        # Record processing rate for time estimation
+        current_time = time.time()
+        if not self.start_time:
+            self.start_time = current_time
+            
+        if len(self.processing_history) >= self.history_window:
+            self.processing_history.pop(0)  # Remove oldest entry
+            
+        self.processing_history.append(current_time)
+        
+    def get_progress(self):
+        """
+        Get the current progress statistics.
+        
+        Returns:
+            dict: Progress information including percentage, files remaining, and estimated time
+        """
+        if self.total_files == 0:
+            return {
+                "percent": 0,
+                "files_processed": 0,
+                "files_total": 0,
+                "files_remaining": 0,
+                "time_elapsed": 0,
+                "time_remaining": "Unknown",
+                "status": "No files to process"
+            }
+            
+        percent = (self.processed_files / self.total_files) * 100
+        files_remaining = self.total_files - self.processed_files
+        
+        # Calculate time elapsed
+        current_time = time.time()
+        time_elapsed = 0 if not self.start_time else current_time - self.start_time
+        
+        # Estimate time remaining
+        if len(self.processing_history) >= 2 and self.processed_files > 0:
+            # Calculate processing rate based on recent history
+            first_time = self.processing_history[0]
+            last_time = self.processing_history[-1]
+            if last_time > first_time:  # Avoid division by zero
+                recent_rate = len(self.processing_history) / (last_time - first_time)  # files per second
+                time_remaining_sec = files_remaining / recent_rate if recent_rate > 0 else float('inf')
+                
+                # Format time remaining
+                if time_remaining_sec == float('inf'):
+                    time_remaining = "Unknown"
+                elif time_remaining_sec < 60:
+                    time_remaining = f"{int(time_remaining_sec)}s"
+                elif time_remaining_sec < 3600:
+                    time_remaining = f"{int(time_remaining_sec / 60)}m {int(time_remaining_sec % 60)}s"
+                else:
+                    hours = int(time_remaining_sec / 3600)
+                    minutes = int((time_remaining_sec % 3600) / 60)
+                    time_remaining = f"{hours}h {minutes}m"
+            else:
+                time_remaining = "Calculating..."
+        else:
+            time_remaining = "Calculating..."
+            
+        return {
+            "percent": percent,
+            "files_processed": self.processed_files,
+            "files_total": self.total_files,
+            "files_remaining": files_remaining,
+            "time_elapsed": time_elapsed,
+            "time_remaining": time_remaining,
+            "status": "In progress" if files_remaining > 0 else "Complete"
+        }
+        
+    def get_status_message(self):
+        """Get a formatted status message for console display."""
+        progress = self.get_progress()
+        
+        if progress["files_total"] == 0:
+            return "No files to process"
+            
+        return (f"Downloading: {progress['files_total']} Files, "
+                f"{progress['percent']:.1f}% Complete "
+                f"({progress['files_processed']}/{progress['files_total']}) "
+                f"[{progress['time_remaining']} Remaining]")
+                
+    def is_empty(self):
+        """Check if the queue is empty."""
+        return len(self.queue) == 0
+        
+    def reset(self):
+        """Reset the queue and all metrics."""
+        self.queue = []
+        self.total_files = 0
+        self.processed_files = 0
+        self.start_time = None
+        self.processing_history = []
+
 class RepositoryFetcher:
     """Handles fetching repositories and their contents."""
 
@@ -28,6 +155,7 @@ class RepositoryFetcher:
         """
         self.client = client if client is not None else GitHubClient(token=github_token)
         self.cache_dir = CACHE_DIR
+        self.download_queue = DownloadQueue()  # Initialize download queue
 
     def fetch_organization_repos(self, org_name):
         """Fetch all repositories for an organization."""
@@ -62,10 +190,21 @@ class RepositoryFetcher:
         logger.info(f"Fetching repository: {owner}/{repo}")
         return self.client.get_repository(owner, repo)
 
-    def fetch_relevant_content(self, owner, repo, branch=None, progress_callback=None):
+    def fetch_relevant_content(self, owner, repo, branch=None, progress_callback=None, _cancellation_event=None):
         """
         Recursively fetch relevant content from a repository.
         Focuses on documentation, examples, samples, and cookbook folders.
+        Uses a two-phase approach: first scan for all relevant files, then download them.
+        
+        Args:
+            owner: Repository owner
+            repo: Repository name
+            branch: Branch to fetch
+            progress_callback: Function to call with progress updates
+            _cancellation_event: Event that can be set to cancel the operation
+            
+        Returns:
+            List of content files
         """
         if not branch:
             try:
@@ -82,17 +221,93 @@ class RepositoryFetcher:
 
         # Indicate progress started
         if progress_callback:
-            progress_callback(15)
-
-        # Start with root directory
-        return self._fetch_directory_content(
-            owner, repo, "", branch, repo_cache_dir, progress_callback
-        )
+            progress_callback(5)
+            
+        # Check for early cancellation
+        if _cancellation_event and _cancellation_event.is_set():
+            logger.info(f"Operation cancelled before scanning repository structure for {owner}/{repo}")
+            return []
+            
+        # Phase 1: Scan the repository to identify all relevant files without downloading
+        try:
+            repo_structure = self.client.scan_repository_structure(owner, repo, branch)
+            
+            # Check for cancellation after scanning
+            if _cancellation_event and _cancellation_event.is_set():
+                logger.info(f"Operation cancelled after scanning repository structure for {owner}/{repo}")
+                return []
+            
+            # Update progress after scanning
+            if progress_callback:
+                progress_callback(15)
+                
+            logger.info(f"Scanned repository structure for {owner}/{repo}: "
+                        f"Found {repo_structure['total_files']} total files, "
+                        f"{repo_structure['relevant_files']} relevant files, "
+                        f"{len(repo_structure['relevant_paths'])} relevant paths")
+                        
+            # Phase 2: Build a download queue from the scan results
+            self.download_queue.reset()  # Clear any existing queue
+            
+            # Create a file list from all relevant paths
+            all_file_items = []
+            for path in repo_structure['relevant_paths']:
+                # Check for cancellation during path processing
+                if _cancellation_event and _cancellation_event.is_set():
+                    logger.info(f"Operation cancelled during path processing for {owner}/{repo}")
+                    return []
+                    
+                logger.debug(f"Preparing to fetch files from relevant path: {path}")
+                files_to_download = self._identify_files_to_download(
+                    repo_structure, path, owner, repo, branch, repo_cache_dir
+                )
+                all_file_items.extend(files_to_download)
+                
+            if not all_file_items:
+                logger.warning(f"No relevant files found in {owner}/{repo}")
+                return []
+                
+            # Add all files to the download queue
+            self.download_queue.add_files(all_file_items)
+            
+            # Update progress now that queue is prepared
+            if progress_callback:
+                progress_callback(20)
+                
+            # Phase 3: Download all queued files
+            return self._download_queued_files(owner, repo, branch, progress_callback, _cancellation_event)
+            
+        except GitHubAPIError as e:
+            logger.error(f"Error scanning repository structure: {e}")
+            # Fall back to the original recursive approach if scanning fails
+            logger.warning("Falling back to direct recursive fetch")
+            return self._fetch_directory_content(
+                owner, repo, "", branch, repo_cache_dir, progress_callback, _cancellation_event
+            )
 
     def _fetch_directory_content(
-        self, owner, repo, path, branch, base_dir, progress_callback=None
+        self, owner, repo, path, branch, base_dir, progress_callback=None, _cancellation_event=None
     ):
-        """Recursively fetch content from a directory with improved rate limiting."""
+        """
+        Recursively fetch content from a directory with improved rate limiting.
+        
+        Args:
+            owner: Repository owner
+            repo: Repository name
+            path: Path to fetch
+            branch: Branch to use
+            base_dir: Base directory to save files
+            progress_callback: Function to call with progress updates
+            _cancellation_event: Event that can be set to cancel the operation
+            
+        Returns:
+            List of file data
+        """
+        # Check for cancellation
+        if _cancellation_event and _cancellation_event.is_set():
+            logger.info(f"Operation cancelled before fetching directory {path}")
+            return []
+            
         try:
             contents = self.client.get_repository_contents(owner, repo, path, branch)
         except GitHubAPIError as e:
@@ -110,6 +325,11 @@ class RepositoryFetcher:
         # Indicate progress for this directory
         if progress_callback and not path:  # Only for root directory
             progress_callback(20)
+
+        # Check for cancellation
+        if _cancellation_event and _cancellation_event.is_set():
+            logger.info(f"Operation cancelled after fetching directory list for {path}")
+            return []
 
         for item in contents:
             item_name = item["name"]
@@ -144,13 +364,18 @@ class RepositoryFetcher:
                     self._is_text_file(item_name)
                     and item["size"] / 1024 / 1024 <= MAX_FILE_SIZE_MB
                 ):
-                    files_data.append(
-                        self._process_file(owner, repo, item, branch, base_dir)
-                    )
+                    # Process file
+                    file_data = self._process_file(owner, repo, item, branch, base_dir)
+                    files_data.append(file_data)
 
         # Update progress again after processing this directory
         if progress_callback and not path:  # Only for root directory
             progress_callback(30)
+            
+        # Check for cancellation before starting subdirectory processing
+        if _cancellation_event and _cancellation_event.is_set():
+            logger.info(f"Operation cancelled before processing subdirectories for {path}")
+            return files_data  # Return what we've processed so far
 
         # Use ThreadPoolExecutor with fewer workers (3 instead of 10)
         with ThreadPoolExecutor(max_workers=3) as executor:
@@ -166,11 +391,18 @@ class RepositoryFetcher:
                         branch,
                         subdir_local,
                         progress_callback,
+                        _cancellation_event
                     )
                 )
 
             # Collect results from all futures
             for future in futures:
+                # Check for cancellation during future processing
+                if _cancellation_event and _cancellation_event.is_set():
+                    logger.info(f"Operation cancelled during subdirectory processing for {path}")
+                    executor.shutdown(wait=False)
+                    return files_data  # Return what we've processed so far
+                    
                 try:
                     result = future.result()
                     files_data.extend(result)
@@ -235,6 +467,210 @@ class RepositoryFetcher:
         """Check if a file is a text file based on extension."""
         return any(filename.lower().endswith(ext) for ext in TEXT_FILE_EXTENSIONS)
 
+    def _identify_files_to_download(self, repo_structure, path, owner, repo, branch, base_dir):
+        """
+        Identify files to download from a specific path based on the repository structure.
+        
+        Args:
+            repo_structure (dict): Repository structure from scan_repository_structure
+            path (str): Path to process
+            owner (str): Repository owner
+            repo (str): Repository name
+            branch (str): Branch to use
+            base_dir (Path): Base directory for local storage
+            
+        Returns:
+            list: List of file items to download
+        """
+        # Find this path in the structure
+        current_path = repo_structure["structure"]
+        if path:
+            try:
+                for part in path.split("/"):
+                    current_path = current_path.get(part, {})
+            except (KeyError, AttributeError):
+                logger.warning(f"Path {path} not found in repository structure")
+                return []
+                
+        # Extract files from this path
+        files_to_download = []
+        if "files" in current_path and isinstance(current_path["files"], list):
+            for file_info in current_path["files"]:
+                # Check if this is a text file we want to download
+                if (self._is_text_file(file_info["name"]) and 
+                    file_info["size"] / 1024 / 1024 <= MAX_FILE_SIZE_MB):
+                    
+                    # Create local path
+                    file_path = Path(base_dir)
+                    if path:
+                        file_path = file_path / path
+                    file_path = file_path / file_info["name"]
+                    
+                    # Add file to download queue
+                    download_item = {
+                        "owner": owner,
+                        "repo": repo,
+                        "path": file_info["path"],
+                        "branch": branch,
+                        "sha": file_info["sha"],
+                        "name": file_info["name"],
+                        "size": file_info["size"],
+                        "local_path": str(file_path),
+                        "url": file_info.get("download_url", ""),
+                    }
+                    files_to_download.append(download_item)
+        
+        return files_to_download
+        
+    def _download_queued_files(self, owner, repo, branch, progress_callback=None, _cancellation_event=None):
+        """
+        Download all files in the queue with progress tracking.
+        
+        Args:
+            owner (str): Repository owner
+            repo (str): Repository name
+            branch (str): Branch to use
+            progress_callback (function): Progress callback function
+            _cancellation_event (Event): Event that can be set to cancel the operation
+            
+        Returns:
+            list: List of downloaded file data
+        """
+        queue = self.download_queue
+        total_files = queue.total_files
+        
+        if total_files == 0:
+            logger.warning(f"No files to download for {owner}/{repo}")
+            return []
+            
+        logger.info(f"Downloading {total_files} files from {owner}/{repo}")
+        
+        # Check for cancellation before starting downloads
+        if _cancellation_event and _cancellation_event.is_set():
+            logger.info(f"Operation cancelled before file download for {owner}/{repo}")
+            return []
+        
+        # Start with initial progress
+        if progress_callback:
+            progress_callback(25)  # We're at 25% after scanning and queueing
+            
+        # Prepare for parallel downloads
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            # Process files in batches for better progress tracking
+            batch_size = 5
+            downloaded_files = []
+            last_progress_update = time.time()
+            progress_update_interval = 0.5  # Update status at most every 0.5 seconds
+            
+            while not queue.is_empty():
+                # Check for cancellation before each batch
+                if _cancellation_event and _cancellation_event.is_set():
+                    logger.info(f"Operation cancelled during file download for {owner}/{repo}")
+                    executor.shutdown(wait=False)
+                    return downloaded_files  # Return what we've got so far
+                
+                batch = []
+                for _ in range(min(batch_size, len(queue.queue))):
+                    next_file = queue.get_next_file()
+                    if next_file:
+                        batch.append(next_file)
+                
+                # Submit batch for download
+                futures = []
+                for file_item in batch:
+                    futures.append(executor.submit(
+                        self._download_single_file, 
+                        file_item["owner"],
+                        file_item["repo"],
+                        file_item["path"],
+                        file_item["branch"],
+                        file_item["local_path"]
+                    ))
+                
+                # Process results
+                for i, future in enumerate(futures):
+                    # Check for cancellation during future processing
+                    if _cancellation_event and _cancellation_event.is_set():
+                        logger.info(f"Operation cancelled while processing download futures for {owner}/{repo}")
+                        executor.shutdown(wait=False)
+                        return downloaded_files  # Return what we've got so far
+                    
+                    try:
+                        result = future.result()
+                        if result:
+                            downloaded_files.append(result)
+                        queue.mark_processed()
+                    except Exception as e:
+                        logger.error(f"Error downloading file: {e}")
+                        queue.mark_processed()  # Still mark as processed to update progress
+                
+                # Update progress callback (but not too frequently)
+                current_time = time.time()
+                if current_time - last_progress_update >= progress_update_interval:
+                    progress_info = queue.get_progress()
+                    logger.debug(queue.get_status_message())
+                    
+                    if progress_callback:
+                        # Map our queue progress (0-100%) to the expected progress range (25-90%)
+                        callback_progress = 25 + (progress_info["percent"] * 0.65)
+                        progress_callback(min(90, callback_progress))
+                        
+                    last_progress_update = current_time
+        
+        # Final check for cancellation
+        if _cancellation_event and _cancellation_event.is_set():
+            logger.info(f"Operation cancelled at end of download phase for {owner}/{repo}")
+            return downloaded_files
+        
+        # Final progress update
+        if progress_callback:
+            progress_callback(95)
+            
+        logger.info(f"Downloaded {len(downloaded_files)} files from {owner}/{repo}")
+        return downloaded_files
+        
+    def _download_single_file(self, owner, repo, path, branch, local_path):
+        """
+        Download a single file and save it locally.
+        
+        Args:
+            owner (str): Repository owner
+            repo (str): Repository name
+            path (str): File path
+            branch (str): Branch to use
+            local_path (str): Local path to save the file
+            
+        Returns:
+            dict: File information or None on failure
+        """
+        try:
+            # Ensure parent directory exists
+            Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+            
+            # Download file
+            file_content = self.client.get_repository_file(owner, repo, path, branch)
+            
+            # Save file locally
+            Path(local_path).write_text(file_content, encoding="utf-8", errors="replace")
+            
+            return {
+                "name": Path(path).name,
+                "path": path,
+                "local_path": local_path,
+                "repo": f"{owner}/{repo}",
+                "branch": branch,
+                "size": len(file_content),
+            }
+        except Exception as e:
+            logger.error(f"Error downloading file {path}: {e}")
+            # Create error marker file
+            try:
+                error_path = f"{local_path}.error"
+                Path(error_path).write_text(f"Error downloading: {str(e)}", encoding="utf-8")
+            except Exception:
+                pass
+            return None
+    
     def _is_pdf_file(self, filename):
         """Check if a file is a PDF file based on extension."""
         return filename.lower().endswith(".pdf")

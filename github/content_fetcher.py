@@ -2,10 +2,13 @@ import logging
 import re
 import atexit
 import signal
+import time
 from github.repository import RepositoryFetcher
-from utils.performance import async_process  # Add this import
+from utils.performance import async_process
+from utils.task_tracker import TaskTracker
 from concurrent.futures import ThreadPoolExecutor
 import requests
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +49,12 @@ class ContentFetcher:
         self.github_token = github_token
         # Create GitHub client using the proper authentication
         self.github_client = self.repo_fetcher.client
+        self.task_tracker = TaskTracker()
+        
+        # Status display variables
+        self.status_thread = None
+        self.stop_status_display = threading.Event()
+        self.current_status = ""
 
     def fetch_organization_repositories(
         self, org_name, callback=None, _cancellation_event=None
@@ -167,8 +176,83 @@ class ContentFetcher:
             logger.error(f"Failed to fetch repository {repo_url}: {e}")
             raise
 
-    def fetch_content_for_dataset(self, repo_data, branch=None, progress_callback=None):
-        """Fetch content suitable for dataset creation."""
+    def _start_status_display(self, task_id=None):
+        """
+        Start a background thread to display download status in the console.
+        
+        Args:
+            task_id (str, optional): Task ID for tracking
+        """
+        self.stop_status_display.clear()
+        self.status_thread = threading.Thread(
+            target=self._status_display_thread,
+            args=(task_id,),
+            daemon=True
+        )
+        self.status_thread.start()
+        
+    def _status_display_thread(self, task_id=None):
+        """
+        Background thread that periodically updates the console with download status.
+        
+        Args:
+            task_id (str, optional): Task ID for tracking
+        """
+        try:
+            while not self.stop_status_display.is_set():
+                if self.repo_fetcher and hasattr(self.repo_fetcher, 'download_queue'):
+                    # Get current status from the download queue
+                    status_message = self.repo_fetcher.download_queue.get_status_message()
+                    
+                    if status_message != self.current_status:
+                        # Only print status when it changes to reduce console spam
+                        self.current_status = status_message
+                        
+                        # Clear the line and print the updated status
+                        print(f"\r{' ' * 100}", end="\r")  # Clear the line
+                        print(f"\r{status_message}", end="", flush=True)
+                        
+                        # Update task tracker if we have a task ID
+                        if task_id:
+                            progress = self.repo_fetcher.download_queue.get_progress()
+                            self.task_tracker.update_task_progress(
+                                task_id,
+                                progress["percent"],
+                                stage="downloading",
+                                stage_progress=progress["percent"]
+                            )
+                
+                # Sleep briefly before next update
+                time.sleep(0.5)
+                
+        except Exception as e:
+            logger.error(f"Error in status display thread: {e}")
+        finally:
+            # Clear the line before exiting
+            print(f"\r{' ' * 100}", end="\r")
+            
+    def _stop_status_display(self):
+        """Stop the status display thread."""
+        if self.status_thread and self.status_thread.is_alive():
+            self.stop_status_display.set()
+            self.status_thread.join(timeout=1.0)
+            
+            # Print a newline to ensure next output starts on a clean line
+            print()
+
+    def fetch_content_for_dataset(self, repo_data, branch=None, progress_callback=None, _cancellation_event=None):
+        """
+        Fetch content suitable for dataset creation.
+        
+        Args:
+            repo_data: Repository data (URL string or repository dict)
+            branch: Branch to fetch from (optional)
+            progress_callback: Function to call with progress updates
+            _cancellation_event: Event that can be set to cancel the operation
+            
+        Returns:
+            List of content files
+        """
         if isinstance(repo_data, str):
             # Handle single repository URL
             match = re.match(r"https?://github\.com/([^/]+)/([^/]+)", repo_data)
@@ -184,7 +268,25 @@ class ContentFetcher:
                 branch = repo_data.get("default_branch")
 
         logger.info(f"Fetching content for dataset creation: {owner}/{repo}")
+        task_id = None
+        
         try:
+            # Create task for tracking
+            task_id = self.task_tracker.create_task(
+                "repository_fetch",
+                {"owner": owner, "repo": repo, "branch": branch},
+                f"Fetching content from {owner}/{repo}"
+            )
+            
+            # Start status display
+            self._start_status_display(task_id)
+            
+            # Check for early cancellation
+            if _cancellation_event and _cancellation_event.is_set():
+                logger.info(f"Operation cancelled before starting fetch for {owner}/{repo}")
+                self.task_tracker.cancel_task(task_id)
+                return []
+            
             # Initialize progress at 10% to show activity
             if progress_callback:
                 progress_callback(10)
@@ -192,11 +294,15 @@ class ContentFetcher:
             content_files = self.repo_fetcher.fetch_relevant_content(
                 owner, repo, branch, progress_callback=progress_callback
             )
+            
+            # Check for cancellation after content fetch
+            if _cancellation_event and _cancellation_event.is_set():
+                logger.info(f"Operation cancelled after content fetch for {owner}/{repo}")
+                self.task_tracker.cancel_task(task_id)
+                return []
 
             if progress_callback:
-                progress_callback(
-                    90
-                )  # Better progress indication - fetching is almost done
+                progress_callback(90)  # Almost done
 
             logger.info(
                 f"Fetched {len(content_files)} relevant files from {owner}/{repo}"
@@ -205,130 +311,353 @@ class ContentFetcher:
             # Complete progress
             if progress_callback:
                 progress_callback(100)
+                
+            # Complete the task
+            self.task_tracker.complete_task(
+                task_id, 
+                success=True,
+                result={"files_count": len(content_files)}
+            )
 
             return content_files
         except Exception as e:
             logger.error(f"Failed to fetch content for {owner}/{repo}: {e}")
+            
+            # Update task if we have one
+            if task_id:
+                self.task_tracker.complete_task(
+                    task_id,
+                    success=False,
+                    result={"error": str(e)}
+                )
+                
             # Make sure we indicate an error through the progress callback
             if progress_callback:
                 progress_callback(-1)  # Use negative value to indicate error
             raise
+        finally:
+            # Always stop the status display
+            self._stop_status_display()
 
-    def fetch_multiple_repositories(self, org_name, progress_callback=None):
-        """Fetch content from multiple repositories in an organization."""
+    def fetch_multiple_repositories(self, org_name, progress_callback=None, _cancellation_event=None):
+        """
+        Fetch content from multiple repositories in an organization.
+        
+        Args:
+            org_name: Name of the organization
+            progress_callback: Function to call with progress updates
+            _cancellation_event: Event that can be set to cancel the operation
+            
+        Returns:
+            List of content files
+        """
+        task_id = None
+        
         try:
+            # Create task for tracking
+            task_id = self.task_tracker.create_task(
+                "organization_fetch",
+                {"org": org_name},
+                f"Fetching content from organization {org_name}"
+            )
+            
             # Progress sections:
-            # 0-20%: Fetch repositories list
-            # 20-70%: Process repositories
-            # 70-100%: Create dataset
+            # 0-20%: Fetch repositories list and scan folder structures
+            # 20-90%: Download and process files
+            # 90-100%: Final processing
 
+            # Start status display
+            self._start_status_display(task_id)
+            
+            # Update task status
+            self.task_tracker.update_task_progress(
+                task_id, 
+                5, 
+                stage="scanning_repositories",
+                stage_progress=5
+            )
+            
+            # Check for cancellation
+            if _cancellation_event and _cancellation_event.is_set():
+                self.task_tracker.cancel_task(task_id)
+                return []
+
+            # Phase 1: Fetch all repositories in the organization
             repos = self.fetch_org_repositories(org_name, progress_callback)
+            
+            # Check for cancellation after repository fetch
+            if _cancellation_event and _cancellation_event.is_set():
+                logger.info("Operation cancelled during repository fetch")
+                self.task_tracker.cancel_task(task_id)
+                return []
 
             if not repos:
                 logger.warning(f"No repositories found for organization {org_name}")
                 if progress_callback:
                     progress_callback(70)  # Skip to the end of this stage
+                self.task_tracker.complete_task(
+                    task_id,
+                    success=True,
+                    result={"files_count": 0, "message": "No repositories found"}
+                )
                 return []
 
             logger.info(f"Found {len(repos)} repositories in {org_name}")
             logger.debug(f"Repository names: {[repo['name'] for repo in repos[:5]]}...")
 
             if progress_callback:
-                logger.debug("Updating progress to 20% after finding repositories")
-                progress_callback(20)
+                logger.debug("Updating progress to 10% after finding repositories")
+                progress_callback(10)
+                
+            self.task_tracker.update_task_progress(
+                task_id,
+                10,
+                stage="scanning_repositories",
+                stage_progress=50
+            )
 
-            # Process each repo with detailed progress
-            def fetch_repo_content(repo):
-                try:
-                    logger.debug(f"Processing repository: {repo['name']}")
-                    # Don't pass progress_callback here to avoid conflicts
-                    return self.fetch_content_for_dataset(repo)
-                except Exception as e:
-                    logger.error(
-                        f"Error processing repository {repo['name']}: {e}",
-                        exc_info=True,
-                    )
-                    return []
-
-            all_content = []
-            batch_size = min(
-                5, len(repos)
-            )  # Smaller batches for better progress tracking
-
+            # Phase 2: Scan all repositories to identify relevant files first
+            scan_results = []
+            
             try:
+                # Function to scan a single repository
+                def scan_repository_structure(repo):
+                    try:
+                        owner = repo["owner"]["login"]
+                        repo_name = repo["name"]
+                        branch = repo.get("default_branch")
+                        
+                        logger.debug(f"Scanning repository structure: {owner}/{repo_name}")
+                        
+                        # Scan repository structure without downloading files
+                        scan_result = self.github_client.scan_repository_structure(
+                            owner, repo_name, branch
+                        )
+                        
+                        return {
+                            "owner": owner,
+                            "repo": repo_name,
+                            "branch": branch,
+                            "scan_result": scan_result
+                        }
+                    except Exception as e:
+                        logger.error(f"Error scanning repository {repo['name']}: {e}")
+                        return None
+                
+                # Process repositories in batches to avoid overwhelming the API
+                batch_size = min(5, len(repos))
                 for i in range(0, len(repos), batch_size):
-                    # Handle smaller batches
-                    batch = repos[i : i + batch_size]
-                    batch_names = [repo["name"] for repo in batch]
-                    logger.debug(f"Processing batch {i//batch_size + 1}: {batch_names}")
-
+                    # Check for cancellation before processing each batch
+                    if _cancellation_event and _cancellation_event.is_set():
+                        logger.info("Operation cancelled during repository scanning")
+                        self.task_tracker.cancel_task(task_id)
+                        return []
+                        
+                    batch = repos[i:i+batch_size]
+                    logger.debug(f"Scanning batch {i//batch_size + 1}: {[r['name'] for r in batch]}")
+                    
                     # Use direct threading for better control
                     executor = get_executor()
-                    futures = [
-                        executor.submit(fetch_repo_content, repo) for repo in batch
-                    ]
-
-                    batch_content = []
-                    for j, future in enumerate(futures):
+                    futures = [executor.submit(scan_repository_structure, repo) for repo in batch]
+                    
+                    # Collect results
+                    for future in futures:
                         try:
+                            # Check for cancellation during future processing
+                            if _cancellation_event and _cancellation_event.is_set():
+                                executor.shutdown(wait=False)
+                                logger.info("Operation cancelled during repository scanning futures")
+                                self.task_tracker.cancel_task(task_id)
+                                return []
+                                
                             result = future.result(timeout=300)  # 5-minute timeout
-                            repo_name = batch_names[j]
-                            result_count = (
-                                len(result) if isinstance(result, list) else 0
-                            )
-                            logger.debug(
-                                f"Repository {repo_name} returned {result_count} files"
-                            )
-
-                            if isinstance(result, list):
-                                batch_content.extend(result)
-                            else:
-                                logger.warning(
-                                    f"Unexpected result type from {repo_name}: {type(result)}"
-                                )
+                            if result:
+                                scan_results.append(result)
                         except Exception as e:
-                            logger.error(
-                                f"Error in batch processing: {e}", exc_info=True
-                            )
-
-                    all_content.extend(batch_content)
-
+                            logger.error(f"Error in scan batch processing: {e}")
+                    
+                    # Update progress (10-20%)
                     if progress_callback:
-                        # Update progress proportionally (20-70%)
-                        progress_percent = 20 + 50 * min(
-                            (i + batch_size) / len(repos), 1.0
-                        )
-                        logger.debug(
-                            f"Batch complete, updating progress to {progress_percent:.1f}%"
-                        )
-                        progress_callback(progress_percent)
-
-                        # Add detailed log for this batch
-                        logger.debug(
-                            f"Batch {i//batch_size + 1}/{(len(repos)+batch_size-1)//batch_size}: "
-                            f"Found {len(batch_content)} files"
-                        )
-
-                if progress_callback:
-                    logger.debug(
-                        "Repository processing complete, updating progress to 70%"
+                        scan_progress = 10 + 10 * min((i + batch_size) / len(repos), 1.0)
+                        progress_callback(scan_progress)
+                        
+                    # Update task status
+                    self.task_tracker.update_task_progress(
+                        task_id,
+                        scan_progress,
+                        stage="scanning_repositories",
+                        stage_progress=min(100, (i + batch_size) / len(repos) * 100)
                     )
-                    progress_callback(70)
-
-                logger.info(
-                    f"Fetched total of {len(all_content)} files from repositories"
+                    
+                # Log overall scan results
+                total_relevant_files = sum(
+                    r["scan_result"]["relevant_files"] for r in scan_results if r and "scan_result" in r
                 )
-                return all_content
+                logger.info(
+                    f"Completed scanning {len(scan_results)} repositories. "
+                    f"Found {total_relevant_files} relevant files."
+                )
+                
+                # Update task status for download phase
+                self.task_tracker.update_task_progress(
+                    task_id,
+                    20,
+                    stage="downloading_files",
+                    stage_progress=0
+                )
+                
+                # Phase 3: Build a global download queue from scan results
+                download_queue = self.repo_fetcher.download_queue
+                download_queue.reset()
+                
+                # Identify all files to download
+                all_files_to_download = []
+                
+                for scan_result in scan_results:
+                    if not scan_result or "scan_result" not in scan_result:
+                        continue
+                        
+                    owner = scan_result["owner"]
+                    repo_name = scan_result["repo"]
+                    branch = scan_result["branch"]
+                    structure = scan_result["scan_result"]
+                    
+                    # Create repository cache directory
+                    repo_cache_dir = self.repo_fetcher.cache_dir / owner / repo_name
+                    repo_cache_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Add files from all relevant paths in this repository
+                    for path in structure.get("relevant_paths", []):
+                        files = self.repo_fetcher._identify_files_to_download(
+                            structure, path, owner, repo_name, branch, repo_cache_dir
+                        )
+                        all_files_to_download.extend(files)
+                
+                # Add all files to the global download queue
+                if all_files_to_download:
+                    download_queue.add_files(all_files_to_download)
+                    logger.info(f"Added {len(all_files_to_download)} files to download queue")
+                else:
+                    logger.warning("No files identified for download")
+                    
+                # Phase 4: Download all queued files
+                if download_queue.total_files > 0:
+                    all_content = []
+                    
+                    # Process files in small batches for better progress display
+                    batch_size = 5
+                    while not download_queue.is_empty():
+                        # Check for cancellation before each batch
+                        if _cancellation_event and _cancellation_event.is_set():
+                            logger.info("Operation cancelled during file download")
+                            self.task_tracker.cancel_task(task_id)
+                            return []
+                            
+                        batch = []
+                        for _ in range(min(batch_size, len(download_queue.queue))):
+                            file_item = download_queue.get_next_file()
+                            if file_item:
+                                batch.append(file_item)
+                                
+                        # Download this batch
+                        with ThreadPoolExecutor(max_workers=3) as executor:
+                            futures = []
+                            for file_item in batch:
+                                futures.append(executor.submit(
+                                    self.repo_fetcher._download_single_file,
+                                    file_item["owner"],
+                                    file_item["repo"],
+                                    file_item["path"],
+                                    file_item["branch"],
+                                    file_item["local_path"]
+                                ))
+                                
+                            # Process results
+                            for future in futures:
+                                # Check for cancellation during future processing
+                                if _cancellation_event and _cancellation_event.is_set():
+                                    executor.shutdown(wait=False)
+                                    logger.info("Operation cancelled during file download futures")
+                                    self.task_tracker.cancel_task(task_id)
+                                    return []
+                                    
+                                try:
+                                    result = future.result()
+                                    if result:
+                                        all_content.append(result)
+                                    download_queue.mark_processed()
+                                except Exception as e:
+                                    logger.error(f"Error downloading file: {e}")
+                                    download_queue.mark_processed()
+                        
+                        # Update progress (20-90%)
+                        progress_info = download_queue.get_progress()
+                        if progress_callback:
+                            download_progress = 20 + (progress_info["percent"] * 0.7)
+                            progress_callback(min(90, download_progress))
+                            
+                        # Update task status
+                        self.task_tracker.update_task_progress(
+                            task_id,
+                            min(90, download_progress),
+                            stage="downloading_files",
+                            stage_progress=progress_info["percent"]
+                        )
+                        
+                    # Complete progress
+                    if progress_callback:
+                        progress_callback(90)
+                        
+                    logger.info(f"Downloaded {len(all_content)} files from {len(scan_results)} repositories")
+                    
+                    # Update task status for completion
+                    self.task_tracker.update_task_progress(
+                        task_id,
+                        100,
+                        stage="complete",
+                        stage_progress=100,
+                        status="completed"
+                    )
+                    
+                    return all_content
+                else:
+                    # No files to download
+                    logger.warning("No files to download in any repositories")
+                    if progress_callback:
+                        progress_callback(90)
+                        
+                    # Complete task
+                    self.task_tracker.complete_task(
+                        task_id,
+                        success=True,
+                        result={"files_count": 0, "message": "No relevant files found"}
+                    )
+                    
+                    return []
+                    
             except RuntimeError as e:
                 if "cannot schedule new futures" in str(e):
-                    logger.warning(
-                        "Interpreter is shutting down. Stopping processing early."
-                    )
+                    logger.warning("Interpreter is shutting down. Stopping processing early.")
+                    self.task_tracker.cancel_task(task_id)
                 else:
                     raise
+                    
         except Exception as e:
             logger.error(
                 f"Failed to fetch multiple repositories for {org_name}: {e}",
                 exc_info=True,
             )
+            
+            # Complete task as failed
+            if task_id:
+                self.task_tracker.complete_task(
+                    task_id,
+                    success=False,
+                    result={"error": str(e)}
+                )
+                
             raise
+            
+        finally:
+            # Always stop the status display
+            self._stop_status_display()

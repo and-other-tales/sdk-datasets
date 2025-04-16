@@ -192,6 +192,105 @@ class GitHubClient:
         except GitHubAPIError as e:
             logger.error(f"Failed to fetch contents for {owner}/{repo}/{path}: {e}")
             raise
+            
+    def scan_repository_structure(self, owner, repo, ref=None):
+        """
+        Scan a repository's directory structure to identify all relevant folders.
+        
+        Args:
+            owner (str): Repository owner
+            repo (str): Repository name
+            ref (str, optional): Branch or commit reference
+            
+        Returns:
+            dict: Dictionary with relevant paths and file metadata
+        """
+        logger.info(f"Scanning repository structure for {owner}/{repo}")
+        result = {
+            "relevant_paths": [],
+            "total_files": 0,
+            "relevant_files": 0,
+            "structure": {}
+        }
+        
+        try:
+            # Start with root directory
+            self._scan_directory_structure(owner, repo, "", ref, result)
+            return result
+        except GitHubAPIError as e:
+            logger.error(f"Failed to scan repository structure for {owner}/{repo}: {e}")
+            raise
+            
+    def _scan_directory_structure(self, owner, repo, path, ref, result, max_depth=10):
+        """Recursively scan directory structure with depth limit."""
+        if max_depth <= 0:
+            return
+            
+        try:
+            contents = self.get_repository_contents(owner, repo, path, ref)
+            
+            if not isinstance(contents, list):
+                # This is a file, not a directory
+                return
+                
+            current_path = result["structure"]
+            if path:
+                # Create nested dict structure based on path
+                path_parts = path.split("/")
+                for part in path_parts:
+                    if part not in current_path:
+                        current_path[part] = {}
+                    current_path = current_path[part]
+            
+            # Check if this is a relevant folder
+            from config.settings import RELEVANT_FOLDERS
+            path_parts = path.split("/") if path else []
+            is_relevant = any(part.lower() in RELEVANT_FOLDERS for part in path_parts)
+            if is_relevant:
+                result["relevant_paths"].append(path)
+            
+            # Process items in this directory
+            for item in contents:
+                result["total_files"] += 1
+                if item["type"] == "dir":
+                    # Skip ignored directories
+                    from config.settings import IGNORED_DIRS
+                    if item["name"] in IGNORED_DIRS:
+                        continue
+                        
+                    # Add directory to structure
+                    if "dirs" not in current_path:
+                        current_path["dirs"] = []
+                    current_path["dirs"].append(item["name"])
+                    
+                    # Recursively scan subdirectory
+                    new_path = f"{path}/{item['name']}" if path else item["name"]
+                    self._scan_directory_structure(owner, repo, new_path, ref, result, max_depth - 1)
+                elif item["type"] == "file":
+                    # Record file in structure
+                    if "files" not in current_path:
+                        current_path["files"] = []
+                    
+                    file_info = {
+                        "name": item["name"],
+                        "path": item["path"],
+                        "size": item["size"],
+                        "sha": item["sha"],
+                        "download_url": item.get("download_url")
+                    }
+                    current_path["files"].append(file_info)
+                    
+                    # Check if file is in a relevant folder
+                    if is_relevant:
+                        # Check file type
+                        from config.settings import TEXT_FILE_EXTENSIONS, MAX_FILE_SIZE_MB
+                        if (any(item["name"].lower().endswith(ext) for ext in TEXT_FILE_EXTENSIONS) and
+                            item["size"] / 1024 / 1024 <= MAX_FILE_SIZE_MB):
+                            result["relevant_files"] += 1
+        except GitHubAPIError as e:
+            logger.warning(f"Error scanning directory {path}: {e}")
+            # Continue with other directories even if one fails
+            return
 
     def get_repository_file(self, owner, repo, path, ref=None):
         """Get the raw content of a file."""

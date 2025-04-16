@@ -7,6 +7,7 @@ from huggingface_hub import HfApi
 from processors.file_processor import FileProcessor
 from processors.metadata_generator import MetadataGenerator
 from utils.performance import distributed_process
+from utils.task_tracker import TaskTracker
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,7 @@ class DatasetCreator:
         self.file_processor = FileProcessor()
         self.metadata_generator = MetadataGenerator()
         self.api = HfApi() if huggingface_token else None
+        self.task_tracker = TaskTracker()
 
     def create_dataset(
         self,
@@ -137,7 +139,7 @@ class DatasetCreator:
             logger.error(f"Error creating dataset: {e}")
             raise
 
-    def push_to_hub(self, dataset, repo_name, private=True, progress_callback=None):
+    def push_to_hub(self, dataset, repo_name, private=True, progress_callback=None, commit_message=None):
         """Push a dataset to the Hugging Face Hub.
         
         Args:
@@ -145,6 +147,7 @@ class DatasetCreator:
             repo_name: The name of the repository to push to
             private: Whether the repository should be private
             progress_callback: Function to call with progress updates
+            commit_message: Custom commit message for updates
             
         Returns:
             bool: Whether the operation was successful
@@ -166,7 +169,7 @@ class DatasetCreator:
                 repo_name, 
                 token=self.token, 
                 private=private if not repo_exists else None,
-                commit_message="Upload dataset"
+                commit_message=commit_message or ("Update dataset" if repo_exists else "Upload dataset")
             )
             
             logger.info(f"Dataset successfully pushed to {repo_name}")
@@ -187,8 +190,23 @@ class DatasetCreator:
         source_info=None,
         private=True,
         progress_callback=None,
+        update_existing=False
     ):
-        """Create a dataset and push it to the Hugging Face Hub."""
+        """
+        Create a dataset and push it to the Hugging Face Hub.
+        
+        Args:
+            file_data_list: List of file data to include in the dataset
+            dataset_name: Name for the dataset
+            description: Dataset description
+            source_info: Source information
+            private: Whether to make the dataset private
+            progress_callback: Function for progress updates
+            update_existing: Whether to update an existing dataset
+        
+        Returns:
+            Tuple of (success, dataset)
+        """
         try:
             # Add progress reporting
             if progress_callback:
@@ -208,14 +226,28 @@ class DatasetCreator:
                 progress_callback(80)  # 80% - dataset created, now pushing
 
             if dataset:
-
                 def push_progress(p):
                     if progress_callback:
                         # Scale from 80-100%
                         progress_callback(80 + p * 0.2)
 
+                # Check if updating or creating new
+                message = None
+                if update_existing:
+                    try:
+                        # Check if dataset exists
+                        username = self.api.whoami()["name"]
+                        repo_url = f"{username}/{dataset_name}"
+                        
+                        # Try to get dataset info to check if it exists
+                        existing = self.api.repo_info(repo_id=repo_url, repo_type="dataset")
+                        logger.info(f"Updating existing dataset: {repo_url}")
+                        message = "Update dataset from GitHub source"
+                    except Exception:
+                        logger.info(f"Dataset {dataset_name} doesn't exist yet, creating new")
+                
                 success = self.push_to_hub(
-                    dataset, dataset_name, private, push_progress
+                    dataset, dataset_name, private, push_progress, commit_message=message
                 )
                 return success, dataset
             return False, None
@@ -224,7 +256,8 @@ class DatasetCreator:
             return False, None
 
     def create_dataset_from_repository(
-        self, repo_url, dataset_name, description, progress_callback=None, _cancellation_event=None
+        self, repo_url, dataset_name, description, progress_callback=None, _cancellation_event=None,
+        task_id=None, resume_from=None, update_existing=False
     ):
         """Create a dataset from a GitHub repository.
         
@@ -234,6 +267,9 @@ class DatasetCreator:
             description: Dataset description
             progress_callback: Function to call with progress updates
             _cancellation_event: Threading event for cancellation
+            task_id: Task ID for tracking (created if not provided)
+            resume_from: Stage to resume from (if resuming a task)
+            update_existing: Whether to update an existing dataset instead of creating new
             
         Returns:
             Dictionary with success status and message
@@ -242,47 +278,100 @@ class DatasetCreator:
         if progress_callback is None:
             progress_callback = lambda p, m=None: None
 
+        # Create or update task tracking
+        if not task_id:
+            task_id = self.task_tracker.create_task(
+                "repository",
+                {
+                    "repo_url": repo_url,
+                    "dataset_name": dataset_name,
+                    "description": description
+                },
+                f"{'Update' if update_existing else 'Create'} dataset '{dataset_name}' from repository {repo_url}"
+            )
+        
+        # Wrapper for progress callback that also updates task tracking
+        def _progress_callback(percent, message=None):
+            # Update task progress
+            self.task_tracker.update_task_progress(
+                task_id, 
+                percent,
+                stage=message,
+                stage_progress=percent
+            )
+            # Call original callback
+            progress_callback(percent, message)
+        
         # Check for early cancellation
         if _cancellation_event and _cancellation_event.is_set():
-            progress_callback(10, "Operation cancelled")
-            return {"success": False, "message": "Operation cancelled by user."}
+            _progress_callback(10, "Operation cancelled")
+            self.task_tracker.cancel_task(task_id)
+            return {"success": False, "message": "Operation cancelled by user.", "task_id": task_id}
         
         try:
             # Extract repository information from URL
-            progress_callback(20, f"Fetching repository: {repo_url}")
+            _progress_callback(20, f"Fetching repository: {repo_url}")
             
             # Process the repository contents
-            progress_callback(25, "Processing repository contents")
+            _progress_callback(25, "Processing repository contents")
             
             # Process repository
             processing_result = self._process_repository(
                 repo_url=repo_url,
                 dataset_name=dataset_name,
                 description=description,
-                progress_callback=progress_callback,
-                _cancellation_event=_cancellation_event
+                progress_callback=_progress_callback,
+                _cancellation_event=_cancellation_event,
+                task_id=task_id,
+                resume_from=resume_from,
+                update_existing=update_existing
             )
             
-            # For test_create_dataset_from_repository_cancel_during_processing
-            # We must check the cancellation event again, as it may have been set during processing
+            # Check for cancellation
             if processing_result is False:
                 logger.info("Processing returned False - operation was cancelled")
-                progress_callback(30, "Operation cancelled")
-                return {"success": False, "message": "Operation cancelled during processing."}
+                _progress_callback(30, "Operation cancelled")
+                self.task_tracker.cancel_task(task_id)
+                return {"success": False, "message": "Operation cancelled during processing.", "task_id": task_id}
                 
             if _cancellation_event and _cancellation_event.is_set():
                 logger.info("Cancellation event was set during processing")
-                progress_callback(30, "Operation cancelled")
-                return {"success": False, "message": "Operation cancelled during processing."}
+                _progress_callback(30, "Operation cancelled")
+                self.task_tracker.cancel_task(task_id)
+                return {"success": False, "message": "Operation cancelled during processing.", "task_id": task_id}
                 
             # If we get here, processing was successful
-            progress_callback(50, "Dataset creation completed successfully")
-            return {"success": True, "message": "Dataset created successfully"}
+            _progress_callback(100, f"Dataset {'update' if update_existing else 'creation'} completed successfully")
+            
+            # Mark task as completed
+            self.task_tracker.complete_task(
+                task_id, 
+                success=True, 
+                result={"dataset_name": dataset_name}
+            )
+            
+            return {
+                "success": True, 
+                "message": f"Dataset {'updated' if update_existing else 'created'} successfully", 
+                "task_id": task_id
+            }
             
         except Exception as e:
             logger.error(f"Error creating dataset from repository: {e}")
-            progress_callback(40, "Error occurred during dataset creation")
-            return {"success": False, "message": str(e)}
+            _progress_callback(40, f"Error: {str(e)}")
+            
+            # Mark task as failed
+            self.task_tracker.complete_task(
+                task_id, 
+                success=False, 
+                result={"error": str(e)}
+            )
+            
+            return {
+                "success": False, 
+                "message": str(e), 
+                "task_id": task_id
+            }
 
     def _process_repository(
         self,
@@ -291,6 +380,9 @@ class DatasetCreator:
         description="",
         progress_callback=None,
         _cancellation_event=None,
+        task_id=None,
+        resume_from=None,
+        update_existing=False
     ):
         """Process a repository's content for dataset creation.
 
@@ -300,6 +392,8 @@ class DatasetCreator:
             description: Description for the dataset
             progress_callback: Function to call with progress updates
             _cancellation_event: Event to check for operation cancellation
+            task_id: Task ID for tracking
+            resume_from: Stage to resume from (if resuming a task)
 
         Returns:
             bool: True if processing completed successfully, False if cancelled
@@ -341,14 +435,16 @@ class DatasetCreator:
                 logger.warning(f"No content files found in repository: {repo_url}")
                 return False
                 
-            # Create dataset
+            # Create or update dataset
             success, dataset = self.create_and_push_dataset(
                 file_data_list=content_files,
                 dataset_name=dataset_name,
                 description=description,
                 source_info=repo_url,
-                progress_callback=lambda p: progress_callback(70 + (p * 0.3), "Creating dataset...") 
-                if progress_callback else None
+                progress_callback=lambda p: progress_callback(70 + (p * 0.3), 
+                                                             "Updating dataset..." if update_existing else "Creating dataset...") 
+                if progress_callback else None,
+                update_existing=update_existing
             )
             
             # Final cancellation check before returning success

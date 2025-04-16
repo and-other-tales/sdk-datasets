@@ -7,10 +7,15 @@ APP_DIR = Path(os.path.expanduser("~/.github_hf_dataset_creator"))
 CACHE_DIR = APP_DIR / "cache"
 LOG_DIR = APP_DIR / "logs"
 CONFIG_DIR = APP_DIR / "config"
+TEMP_DIR = APP_DIR / "temp"  # For temporary files during dataset creation
 
 # Ensure directories exist
-for directory in [APP_DIR, CACHE_DIR, LOG_DIR, CONFIG_DIR]:
+for directory in [APP_DIR, CACHE_DIR, LOG_DIR, CONFIG_DIR, TEMP_DIR]:
     directory.mkdir(exist_ok=True, parents=True)
+    
+# Server settings (defaults, can be overridden in config)
+SERVER_HOST = "0.0.0.0"
+SERVER_PORT = 8080
 
 # GitHub settings
 GITHUB_API_URL = "https://api.github.com"

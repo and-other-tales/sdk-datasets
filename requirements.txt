@@ -1,8 +1,17 @@
+aiohttp==3.11.16
 datasets==3.5.0
+fastapi==0.115.12
 huggingface_hub==0.30.2
 keyring==25.6.0
+mcp==1.6.0
+pydantic==2.11.3
 PyPDF2==3.0.1
 pytest==8.3.5
 python-dotenv==1.1.0
+python_crontab==3.2.0
+python_dateutil==2.9.0.post0
+pytz==2025.2
 Requests==2.32.3
+reverse_geocoder==1.5.1
 urllib3==2.4.0
+uvicorn==0.34.1
