@@ -6,17 +6,16 @@ A CLI application that creates datasets compatible with the Hugging Face Dataset
 
 ## Overview
 
-The **othertales SDK Dataset Generator** addresses the challenge of models producing outdated or invalid code due to incomplete or stale SDK/API knowledge. While RAG agents and commercial search services can help, they often incur high token costs. This tool operates entirely locally—no LLMs or API tokens are required for core dataset creation—by fetching and processing official documentation and examples directly from GitHub.
+> **Note:** This application has been simplified to a CLI-only interface from the previous TUI implementation.
 
-With a single CLI command, users can point to a GitHub repository or organization, and the tool will automatically:
+This application allows you to:
+- Extract content from GitHub repositories
+- Process various file types (Python, Markdown, Jupyter notebooks, JSON, etc.)
+- Create structured datasets suitable for machine learning
+- Push datasets to Hugging Face Hub
+- Manage your datasets with a simple CLI interface
 
-- Discover and extract content from folders like `docs/`, `examples/`, `samples/`, `cookbooks/`, and notebooks.
-- Process multi-format files (Python, Markdown, Jupyter, JSON, etc.) into structured, training-ready datasets.
-- Push or store the resulting datasets for integration into Hugging Face Hub or local SMT fine-tuning pipelines.
-
-The generated datasets guarantee 100% accurate and verified coverage of the latest SDK/API documentation for the libraries most critical to your development workflow.
-
-## Key Features
+## Features
 
 - **SDK Compliant Datasets**: Automatically generate datasets that reflect the most up-to-date SDK/API requirements, eliminating guesswork.
 - **Local, Token-Free Processing**: No LLM calls or commercial API tokens needed for dataset creation—processing happens entirely on your machine.
@@ -139,4 +138,4 @@ Contributions are welcome! Please follow these steps:
 
 ## License
 
-This project is licensed under the MIT License - see the `LICENSE` file for details.
+This project is licensed under the MIT License - see the LICENSE file for details.
