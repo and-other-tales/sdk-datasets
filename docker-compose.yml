@@ -1,0 +1,12 @@
+version: '3'
+
+services:
+  github-hf-dataset-creator:
+    build: .
+    volumes:
+      - ./data:/data
+    stdin_open: true  # Keep STDIN open for interactive TUI
+    tty: true         # Allocate a pseudo-TTY for the TUI
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN}
