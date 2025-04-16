@@ -44,6 +44,8 @@ class ContentFetcher:
     def __init__(self, github_token=None):
         self.repo_fetcher = RepositoryFetcher(github_token=github_token)
         self.github_token = github_token
+        # Create GitHub client using the proper authentication
+        self.github_client = self.repo_fetcher.client
 
     def fetch_organization_repositories(
         self, org_name, callback=None, _cancellation_event=None
@@ -66,22 +68,25 @@ class ContentFetcher:
         all_repos = []
 
         try:
-            # First, get count of repos to calculate progress
-            url = f"https://api.github.com/orgs/{org_name}"
-            headers = (
-                {"Authorization": f"token {self.github_token}"}
-                if self.github_token
-                else {}
-            )
-            response = requests.get(url, headers=headers)
-            response.raise_for_status()
-            org_data = response.json()
-            total_repos = org_data.get("public_repos", 0)
-
-            if callback:
-                callback(0, f"Found {total_repos} repositories in {org_name}")
-
-            # Fetch repos page by page
+            # Use the GitHub client directly instead of direct API calls
+            # This ensures proper authentication and rate limiting
+            logger.info(f"Fetching repositories for organization: {org_name}")
+            
+            # First get the organization info to get the total repo count
+            try:
+                # Use proper GitHub client for authentication
+                org_info = self.github_client.get(f"orgs/{org_name}")
+                total_repos = org_info.get("public_repos", 0)
+                
+                if callback:
+                    callback(0, f"Found {total_repos} repositories in {org_name}")
+            except Exception as e:
+                logger.error(f"Failed to get organization info for {org_name}: {e}")
+                if callback:
+                    callback(0, f"Error: {str(e)}")
+                raise
+            
+            # Now fetch all repositories page by page using the authenticated client
             while True:
                 # Check for cancellation
                 if _cancellation_event and _cancellation_event.is_set():
@@ -90,37 +95,38 @@ class ContentFetcher:
                             processed / max(1, total_repos) * 100, "Operation cancelled"
                         )
                     return []
-
-                url = f"https://api.github.com/orgs/{org_name}/repos?page={page}&per_page=100"
+                
                 try:
-                    response = requests.get(url, headers=headers)
-                    response.raise_for_status()
-                    repos_page = response.json()
+                    # Get repositories for this page using the proper GitHub client
+                    repos_page = self.github_client.get_organization_repos(
+                        org_name, page=page, per_page=100
+                    )
+                    
+                    if not repos_page:
+                        break
+                        
+                    all_repos.extend(repos_page)
+                    processed += len(repos_page)
+                    
+                    if callback:
+                        callback(
+                            processed / max(1, total_repos) * 100,
+                            f"Fetched {processed}/{total_repos} repositories",
+                        )
+                    
+                    # Check if we've reached the end
+                    if len(repos_page) < 100:
+                        break
+                        
+                    page += 1
                 except StopIteration:
                     # Handle StopIteration for test mocks that end early
                     break
-
-                if not repos_page:
-                    break
-
-                all_repos.extend(repos_page)
-                processed += len(repos_page)
-
-                if callback:
-                    callback(
-                        processed / max(1, total_repos) * 100,
-                        f"Fetched {processed}/{total_repos} repositories",
-                    )
-
-                # Check if we've reached the end
-                if len(repos_page) < 100:
-                    break
-
-                page += 1
-
+                
             return all_repos
-
+            
         except Exception as e:
+            logger.error(f"Failed to fetch repositories for organization {org_name}: {e}")
             if callback:
                 callback(0, f"Error: {str(e)}")
             raise

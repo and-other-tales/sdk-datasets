@@ -43,7 +43,8 @@ class GitHubClient:
         self.token = token
         self.headers = {"Accept": "application/vnd.github.v3+json"}
         if token:
-            self.headers["Authorization"] = f"token {token}"
+            # GitHub API accepts both formats but "Bearer" is more modern and standard OAuth format
+            self.headers["Authorization"] = f"Bearer {token}"
         self.session = requests.Session()
 
     def get(self, endpoint, params=None):

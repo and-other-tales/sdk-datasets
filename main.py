@@ -48,21 +48,30 @@ def run_cli():
                     
                     # Initialize clients
                     if github_client is None:
-                        github_token, _ = credentials_manager.get_github_credentials()
+                        github_username, github_token = credentials_manager.get_github_credentials()
                         if not github_token:
                             print("\nError: GitHub token not found. Please set your credentials first.")
                             continue
                         content_fetcher = ContentFetcher(github_token=github_token)
                     
                     if dataset_creator is None:
-                        _, huggingface_token = credentials_manager.get_huggingface_credentials()
+                        hf_username, huggingface_token = credentials_manager.get_huggingface_credentials()
                         if not huggingface_token:
                             print("\nError: Hugging Face token not found. Please set your credentials first.")
                             continue
                         dataset_creator = DatasetCreator(huggingface_token=huggingface_token)
                     
                     print(f"\nFetching repositories from organization: {org_name}")
-                    repos = content_fetcher.fetch_organization_repositories(org_name)
+                    
+                    # Use the more reliable fetch_org_repositories method instead
+                    def progress_callback(percent, message=None):
+                        if message:
+                            print(f"Progress: {percent:.0f}% - {message}")
+                        else:
+                            print(f"Progress: {percent:.0f}%")
+                            
+                    repos = content_fetcher.fetch_org_repositories(org_name, 
+                                                                  progress_callback=lambda p: progress_callback(p))
                     
                     if not repos:
                         print(f"No repositories found for organization: {org_name}")
@@ -71,7 +80,9 @@ def run_cli():
                     print(f"Found {len(repos)} repositories")
                     print("Fetching repository content...")
                     
-                    content = content_fetcher.fetch_multiple_repositories(org_name)
+                    # Use proper progress callback for content fetching
+                    content = content_fetcher.fetch_multiple_repositories(org_name, 
+                                                                         progress_callback=lambda p: progress_callback(p))
                     
                     if not content:
                         print("No content found in repositories")
