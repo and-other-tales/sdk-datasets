@@ -165,8 +165,17 @@ class ContentFetcher:
             )
             raise
 
-    def fetch_single_repository(self, repo_url, progress_callback=None):
-        """Fetch a single repository."""
+    def fetch_single_repository(self, repo_url, progress_callback=None, max_files=None):
+        """Fetch a single repository.
+        
+        Args:
+            repo_url: URL of the repository to fetch
+            progress_callback: Function to call with progress updates
+            max_files: Maximum number of files to fetch (optional limit)
+            
+        Returns:
+            Repository content
+        """
         try:
             repo = self.repo_fetcher.fetch_single_repo(repo_url)
             if progress_callback:

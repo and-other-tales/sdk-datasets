@@ -29,6 +29,10 @@ class DownloadQueue:
         self.processing_history = []  # Track processing rate history
         self.history_window = 20  # Number of samples to keep for rate calculation
         
+    def __repr__(self):
+        """String representation for debugging."""
+        return f"DownloadQueue(total={self.total_files}, processed={self.processed_files}, queue_len={len(self.queue)})"
+        
     def add_file(self, file_info):
         """Add a file to the download queue."""
         self.queue.append(file_info)

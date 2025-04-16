@@ -69,7 +69,7 @@ def test_push_to_hub_success(dataset_creator):
 
     assert success is True
     mock_dataset.push_to_hub.assert_called_once_with(
-        "test_repo", token="mock_token", private=True
+        "test_repo", token="mock_token", private=True, commit_message="Upload dataset"
     )
 
 

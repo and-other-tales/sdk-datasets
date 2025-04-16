@@ -165,11 +165,15 @@ class DatasetCreator:
                 repo_exists = False
                 
             # Use the appropriate push_to_hub parameters
+            # If commit_message is not provided, generate a default one
+            commit_message = commit_message or ("Update dataset" if repo_exists else "Upload dataset")
+            
+            # Push the dataset to the Hugging Face Hub
             dataset.push_to_hub(
                 repo_name, 
                 token=self.token, 
                 private=private if not repo_exists else None,
-                commit_message=commit_message or ("Update dataset" if repo_exists else "Upload dataset")
+                commit_message=commit_message
             )
             
             logger.info(f"Dataset successfully pushed to {repo_name}")
@@ -190,7 +194,8 @@ class DatasetCreator:
         source_info=None,
         private=True,
         progress_callback=None,
-        update_existing=False
+        update_existing=False,
+        _test_data=None
     ):
         """
         Create a dataset and push it to the Hugging Face Hub.
@@ -218,9 +223,19 @@ class DatasetCreator:
                     # Scale to 0-80%
                     progress_callback(p * 0.8)
 
-            dataset = self.create_dataset(
-                file_data_list, dataset_name, description, source_info, create_progress
-            )
+            # Use test data if provided (for testing purposes only)
+            if _test_data is not None:
+                # Create dataset directly from test data
+                dataset = Dataset.from_dict({
+                    "text": [item.get("text", "") for item in _test_data],
+                    "metadata": [json.dumps(item.get("metadata", {})) for item in _test_data]
+                })
+                dataset.info.description = description or dataset_name
+            else:
+                # Normal dataset creation from file data
+                dataset = self.create_dataset(
+                    file_data_list, dataset_name, description, source_info, create_progress
+                )
 
             if progress_callback:
                 progress_callback(80)  # 80% - dataset created, now pushing
